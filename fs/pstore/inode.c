@@ -3,6 +3,20 @@
  * Persistent Storage - ramfs parts.
  *
  * Copyright (C) 2010 Intel Corporation <tony.luck@intel.com>
+ * Copyright (C) 2020 XiaoMi, Inc.
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License version 2 as
+ *  published by the Free Software Foundation.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #include <linux/module.h>
@@ -23,6 +37,12 @@
 #include <linux/pstore.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/syslog.h>
+// xuke @ 20180611	Import pstore patch from XiaoMi.	Begin
+#ifdef CONFIG_PSTORE_LAST_KMSG
+#include <linux/proc_fs.h>
+#endif
+// End
 
 #include "internal.h"
 
@@ -337,6 +357,26 @@ int pstore_put_backend_records(struct pstore_info *psi)
 	return rc;
 }
 
+// xuke @ 20180611	Import pstore patch from XiaoMi.	Begin
+#ifdef CONFIG_PSTORE_LAST_KMSG
+static char *console_buffer;
+static ssize_t console_bufsize;
+
+static ssize_t last_kmsg_read(struct file *file, char __user *buf,
+		size_t len, loff_t *offset)
+{
+	return simple_read_from_buffer(buf, len, offset,
+			console_buffer, console_bufsize);
+}
+
+static const struct file_operations last_kmsg_fops = {
+	.owner          = THIS_MODULE,
+	.read           = last_kmsg_read,
+	.llseek         = default_llseek,
+};
+#endif
+// End
+
 /*
  * Make a regular file in the root directory of our file system.
  * Load it up with "size" bytes of data from "buf".
@@ -393,8 +433,19 @@ int pstore_mkfile(struct dentry *root, struct pstore_record *record)
 
 	d_add(dentry, inode);
 
-	list_add(&private->list, &records_list);
-	mutex_unlock(&records_list_lock);
+	spin_lock_irqsave(&allpstore_lock, flags);
+	list_add(&private->list, &allpstore);
+	spin_unlock_irqrestore(&allpstore_lock, flags);
+
+// xuke @ 20180611	Import pstore patch from XiaoMi.	Begin
+#ifdef CONFIG_PSTORE_LAST_KMSG
+	if (type == PSTORE_TYPE_CONSOLE) {
+		console_buffer = private->data;
+		console_bufsize = size;
+	}
+#endif
+// End
+	inode_unlock(d_inode(root));
 
 	return 0;
 
@@ -489,6 +540,11 @@ static struct file_system_type pstore_fs_type = {
 int __init pstore_init_fs(void)
 {
 	int err;
+// xuke @ 20180611	Import pstore patch from XiaoMi.	Begin
+#ifdef CONFIG_PSTORE_LAST_KMSG
+	struct proc_dir_entry *last_kmsg_entry = NULL;
+#endif
+// End
 
 	/* Create a convenient mount point for people to access pstore */
 	err = sysfs_create_mount_point(fs_kobj, "pstore");
@@ -498,6 +554,16 @@ int __init pstore_init_fs(void)
 	err = register_filesystem(&pstore_fs_type);
 	if (err < 0)
 		sysfs_remove_mount_point(fs_kobj, "pstore");
+// xuke @ 20180611	Import pstore patch from XiaoMi.	Begin
+#ifdef CONFIG_PSTORE_LAST_KMSG
+		last_kmsg_entry = proc_create_data("last_kmsg", S_IFREG | S_IRUGO,
+					NULL, &last_kmsg_fops, NULL);
+		if (!last_kmsg_entry) {
+			pr_err("Failed to create last_kmsg\n");
+			goto out;
+		}
+#endif
+// End
 
 out:
 	return err;
