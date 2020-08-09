@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * drivers/mmc/host/sdhci-msm.c - Qualcomm SDHCI Platform driver
+ * drivers/mmc/host/sdhci-msm.c - Qualcomm Technologies, Inc. MSM SDHCI Platform
+ * driver source file
+ *
+ * Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2020 XiaoMi, Inc.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
  * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
  */
@@ -10,13 +23,9 @@
 #include <linux/delay.h>
 #include <linux/mmc/mmc.h>
 #include <linux/pm_runtime.h>
-#include <linux/pm_opp.h>
-#include <linux/slab.h>
-#include <linux/iopoll.h>
-#include <linux/regulator/consumer.h>
-#include <linux/interconnect.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/reset.h>
+#include <linux/nvmem-consumer.h>
+#include <linux/device.h>
+#include <trace/events/mmc.h>
 
 #include "sdhci-pltfm.h"
 #include "cqhci.h"
@@ -2271,6 +2280,49 @@ static int sdhci_msm_gcc_reset(struct device *dev, struct sdhci_host *host)
 	return ret;
 }
 
+/* add sdcard slot detect status for factory mode
+ *    begin
+ *    */
+static struct kobject *card_slot_device = NULL;
+static struct sdhci_msm_host *host_with_slot_detect = NULL;
+
+static ssize_t card_slot_status_show(struct device *dev,
+					       struct device_attribute *attr, char *buf)
+{
+	if (host_with_slot_detect && gpio_is_valid(host_with_slot_detect->pdata->status_gpio)) {
+		return snprintf(buf, PAGE_SIZE, "%d\n", mmc_gpio_get_cd(host_with_slot_detect->mmc));
+	} else
+		return -EINVAL;
+}
+
+static DEVICE_ATTR(card_slot_status, S_IRUGO ,
+						card_slot_status_show, NULL);
+
+int32_t card_slot_init_device_name(void)
+{
+	int32_t error = 0;
+	if(card_slot_device != NULL){
+		pr_err("card_slot already created\n");
+		return 0;
+	}
+	card_slot_device = kobject_create_and_add("card_slot", NULL);
+	if (card_slot_device == NULL) {
+		printk("%s: card_slot register failed\n", __func__);
+		error = -ENOMEM;
+		return error ;
+	}
+	error = sysfs_create_file(card_slot_device, &dev_attr_card_slot_status.attr);
+	if (error) {
+		printk("%s: card_slot_status_create_file failed\n", __func__);
+		kobject_del(card_slot_device);
+	}
+
+	return 0 ;
+}
+/* add sdcard slot detect status for factory mode
+ *    end
+ *    */
+
 static int sdhci_msm_probe(struct platform_device *pdev)
 {
 	struct sdhci_host *host;
@@ -2499,7 +2551,125 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		goto clk_disable;
 	}
 
-	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY | MMC_CAP_NEED_RSP_BUSY;
+	/* Enable pwr irq interrupts */
+	sdhci_msm_writel_relaxed(INT_MASK, host,
+		msm_host_offset->CORE_PWRCTL_MASK);
+
+#ifdef CONFIG_MMC_CLKGATE
+	/* Set clock gating delay to be used when CONFIG_MMC_CLKGATE is set */
+	msm_host->mmc->clkgate_delay = SDHCI_MSM_MMC_CLK_GATE_DELAY;
+#endif
+
+	/* Set host capabilities */
+	msm_host->mmc->caps |= msm_host->pdata->mmc_bus_width;
+	msm_host->mmc->caps |= msm_host->pdata->caps;
+	msm_host->mmc->caps |= MMC_CAP_AGGRESSIVE_PM;
+	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY;
+	msm_host->mmc->caps2 |= msm_host->pdata->caps2;
+	msm_host->mmc->caps2 |= MMC_CAP2_BOOTPART_NOACC;
+	msm_host->mmc->caps2 |= MMC_CAP2_HS400_POST_TUNING;
+	msm_host->mmc->caps2 |= MMC_CAP2_CLK_SCALE;
+	msm_host->mmc->caps2 |= MMC_CAP2_SANITIZE;
+	msm_host->mmc->caps2 |= MMC_CAP2_MAX_DISCARD_SIZE;
+	msm_host->mmc->caps2 |= MMC_CAP2_SLEEP_AWAKE;
+	msm_host->mmc->pm_caps |= MMC_PM_KEEP_POWER | MMC_PM_WAKE_SDIO_IRQ;
+
+	if (msm_host->pdata->nonremovable)
+		msm_host->mmc->caps |= MMC_CAP_NONREMOVABLE;
+
+	if (msm_host->pdata->nonhotplug)
+		msm_host->mmc->caps2 |= MMC_CAP2_NONHOTPLUG;
+
+	msm_host->mmc->sdr104_wa = msm_host->pdata->sdr104_wa;
+
+	/* Initialize ICE if present */
+	if (msm_host->ice.pdev) {
+		ret = sdhci_msm_ice_init(host);
+		if (ret) {
+			dev_err(&pdev->dev, "%s: SDHCi ICE init failed (%d)\n",
+					mmc_hostname(host->mmc), ret);
+			ret = -EINVAL;
+			goto vreg_deinit;
+		}
+		host->is_crypto_en = true;
+		msm_host->mmc->inlinecrypt_support = true;
+		/* Packed commands cannot be encrypted/decrypted using ICE */
+		msm_host->mmc->caps2 &= ~(MMC_CAP2_PACKED_WR |
+				MMC_CAP2_PACKED_WR_CONTROL);
+	}
+
+	init_completion(&msm_host->pwr_irq_completion);
+
+	if (gpio_is_valid(msm_host->pdata->status_gpio)) {
+		/*
+		 * Set up the card detect GPIO in active configuration before
+		 * configuring it as an IRQ. Otherwise, it can be in some
+		 * weird/inconsistent state resulting in flood of interrupts.
+		 */
+		sdhci_msm_setup_pins(msm_host->pdata, true);
+
+		/*
+		 * This delay is needed for stabilizing the card detect GPIO
+		 * line after changing the pull configs.
+		 */
+		usleep_range(10000, 10500);
+		ret = mmc_gpio_request_cd(msm_host->mmc,
+				msm_host->pdata->status_gpio, 0);
+		if (ret) {
+			dev_err(&pdev->dev, "%s: Failed to request card detection IRQ %d\n",
+					__func__, ret);
+			goto vreg_deinit;
+		}else{
+			host_with_slot_detect = msm_host;
+			card_slot_init_device_name();
+		}
+	}
+
+	if ((sdhci_readl(host, SDHCI_CAPABILITIES) & SDHCI_CAN_64BIT) &&
+		(dma_supported(mmc_dev(host->mmc), DMA_BIT_MASK(64)))) {
+		host->dma_mask = DMA_BIT_MASK(64);
+		mmc_dev(host->mmc)->dma_mask = &host->dma_mask;
+		mmc_dev(host->mmc)->coherent_dma_mask  = host->dma_mask;
+	} else if (dma_supported(mmc_dev(host->mmc), DMA_BIT_MASK(32))) {
+		host->dma_mask = DMA_BIT_MASK(32);
+		mmc_dev(host->mmc)->dma_mask = &host->dma_mask;
+		mmc_dev(host->mmc)->coherent_dma_mask  = host->dma_mask;
+	} else {
+		dev_err(&pdev->dev, "%s: Failed to set dma mask\n", __func__);
+	}
+
+	msm_host->pdata->sdiowakeup_irq = platform_get_irq_byname(pdev,
+							  "sdiowakeup_irq");
+	if (sdhci_is_valid_gpio_wakeup_int(msm_host)) {
+		dev_info(&pdev->dev, "%s: sdiowakeup_irq = %d\n", __func__,
+				msm_host->pdata->sdiowakeup_irq);
+		msm_host->is_sdiowakeup_enabled = true;
+		ret = request_irq(msm_host->pdata->sdiowakeup_irq,
+				  sdhci_msm_sdiowakeup_irq,
+				  IRQF_SHARED | IRQF_TRIGGER_HIGH,
+				  "sdhci-msm sdiowakeup", host);
+		if (ret) {
+			dev_err(&pdev->dev, "%s: request sdiowakeup IRQ %d: failed: %d\n",
+				__func__, msm_host->pdata->sdiowakeup_irq, ret);
+			msm_host->pdata->sdiowakeup_irq = -1;
+			msm_host->is_sdiowakeup_enabled = false;
+			goto vreg_deinit;
+		} else {
+			spin_lock_irqsave(&host->lock, flags);
+			sdhci_msm_cfg_sdiowakeup_gpio_irq(host, false);
+			msm_host->sdio_pending_processing = false;
+			spin_unlock_irqrestore(&host->lock, flags);
+		}
+	}
+
+	sdhci_msm_cmdq_init(host, pdev);
+	ret = sdhci_add_host(host);
+	if (ret) {
+		dev_err(&pdev->dev, "Add host failed (%d)\n", ret);
+		goto vreg_deinit;
+	}
+
+	msm_host->pltfm_init_done = true;
 
 	pm_runtime_get_noresume(&pdev->dev);
 	pm_runtime_set_active(&pdev->dev);
