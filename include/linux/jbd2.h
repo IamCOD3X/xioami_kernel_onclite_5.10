@@ -5,6 +5,7 @@
  * Written by Stephen C. Tweedie <sct@redhat.com>
  *
  * Copyright 1998-2000 Red Hat, Inc --- All Rights Reserved
+ * Copyright (C) 2020 XiaoMi, Inc.
  *
  * Definitions for transaction data structures for the buffer cache
  * filesystem journaling support.
@@ -441,7 +442,7 @@ struct jbd2_inode {
 	/**
 	 * @i_dirty_start:
 	 *
-	 * Offset in bytes where the dirty range for this inode starts.
+	 * Offset in bytes where the dirty range for this inode starts in current transaction.
 	 * [j_list_lock]
 	 */
 	loff_t i_dirty_start;
@@ -449,10 +450,26 @@ struct jbd2_inode {
 	/**
 	 * @i_dirty_end:
 	 *
-	 * Inclusive offset in bytes where the dirty range for this inode
+	 * Inclusive offset in bytes where the dirty range for this inode in current transaction
 	 * ends. [j_list_lock]
 	 */
 	loff_t i_dirty_end;
+
+	/**
+	 * @i_next_dirty_start:
+	 *
+	 * Offset in bytes where the dirty range for this inode starts in next transaction.
+	 * [j_list_lock]
+	 */
+	loff_t i_next_dirty_start;
+
+	/**
+	 * @i_next_dirty_end:
+	 *
+	 * Inclusive offset in bytes where the dirty range for this inode in next transaction
+	 * ends. [j_list_lock]
+	 */
+	loff_t i_next_dirty_end;
 };
 
 struct jbd2_revoke_table_s;
@@ -682,15 +699,16 @@ struct transaction_s
 	atomic_t		t_outstanding_credits;
 
 	/*
-	 * Number of revoke records for this transaction added by already
-	 * stopped handles. [none]
+	 * Number of inodes need to write
+	 * [t_handle_lock]
 	 */
-	atomic_t		t_outstanding_revokes;
+	atomic_t		t_write_inodes;
 
 	/*
-	 * How many handles used this transaction? [none]
+	 * Number of inodes need to wait
+	 * [t_handle_lock]
 	 */
-	atomic_t		t_handle_count;
+	atomic_t		t_wait_inodes;
 
 	/*
 	 * Forward and backward links for the circular list of all transactions
@@ -732,6 +750,10 @@ struct transaction_run_stats_s {
 	unsigned long		rs_locked;
 	unsigned long		rs_flushing;
 	unsigned long		rs_logging;
+	unsigned long		rs_data_flushed;
+	unsigned long		rs_metadata_flushed;
+	unsigned long		rs_committing;
+	unsigned long		rs_callback;
 
 	__u32			rs_handle_count;
 	__u32			rs_blocks;
@@ -1522,16 +1544,14 @@ extern int	   jbd2_journal_clear_err  (journal_t *);
 extern int	   jbd2_journal_bmap(journal_t *, unsigned long, unsigned long long *);
 extern int	   jbd2_journal_force_commit(journal_t *);
 extern int	   jbd2_journal_force_commit_nested(journal_t *);
+extern int	   jbd2_journal_inode_add_write(handle_t *handle, struct jbd2_inode *inode);
+extern int	   jbd2_journal_inode_add_wait(handle_t *handle, struct jbd2_inode *inode);
 extern int	   jbd2_journal_inode_ranged_write(handle_t *handle,
-			struct jbd2_inode *inode, loff_t start_byte,
-			loff_t length);
+					struct jbd2_inode *inode, loff_t start_byte,
+					loff_t length);
 extern int	   jbd2_journal_inode_ranged_wait(handle_t *handle,
-			struct jbd2_inode *inode, loff_t start_byte,
-			loff_t length);
-extern int	   jbd2_journal_submit_inode_data_buffers(
-			struct jbd2_inode *jinode);
-extern int	   jbd2_journal_finish_inode_data_buffers(
-			struct jbd2_inode *jinode);
+					struct jbd2_inode *inode, loff_t start_byte,
+					loff_t length);
 extern int	   jbd2_journal_begin_ordered_truncate(journal_t *journal,
 				struct jbd2_inode *inode, loff_t new_size);
 extern void	   jbd2_journal_init_jbd_inode(struct jbd2_inode *jinode, struct inode *inode);
@@ -1609,6 +1629,7 @@ int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
 int jbd2_log_wait_commit(journal_t *journal, tid_t tid);
 int jbd2_transaction_committed(journal_t *journal, tid_t tid);
 int jbd2_complete_transaction(journal_t *journal, tid_t tid);
+int jbd2_transaction_need_wait(journal_t *journal, tid_t tid);
 int jbd2_log_do_checkpoint(journal_t *journal);
 int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid);
 
