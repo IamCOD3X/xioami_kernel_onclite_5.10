@@ -3,6 +3,7 @@
  *  linux/init/main.c
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
+ *  Copyright (C) 2020 XiaoMi, Inc.
  *
  *  GK 2/5/95  -  Changed to support mounting root fs via NFS
  *  Added initrd & change_root: Werner Almesberger & Hans Lermen, Feb '96
@@ -838,15 +839,13 @@ static void __init mm_init(void)
 	mm_cache_init();
 }
 
-void __init __weak arch_call_rest_init(void)
-{
-	rest_init();
-}
+int fpsensor=1;
 
-asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
+asmlinkage __visible void __init start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
+	char *p=NULL;
 
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
@@ -876,7 +875,14 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	build_all_zonelists(NULL);
 	page_alloc_init();
 
-	pr_notice("Kernel command line: %s\n", saved_command_line);
+	pr_notice("Kernel command line: %s\n", boot_command_line);
+		p = NULL;
+	p= strstr(boot_command_line, "androidboot.fpsensor=fpc");
+	if(p) {
+		fpsensor = 1;//fpc fingerprint
+	} else {
+		fpsensor = 2;//goodix fingerprint
+	}
 	/* parameters may set static keys */
 	jump_label_init();
 	parse_early_param();
