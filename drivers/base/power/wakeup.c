@@ -3,6 +3,9 @@
  * drivers/base/power/wakeup.c - System wakeup events framework
  *
  * Copyright (c) 2010 Rafael J. Wysocki <rjw@sisk.pl>, Novell Inc.
+ * Copyright (C) 2020 XiaoMi, Inc.
+ *
+ * This file is released under the GPLv2.
  */
 #define pr_fmt(fmt) "PM: " fmt
 
@@ -1136,7 +1139,7 @@ static void *wakeup_sources_stats_seq_start(struct seq_file *m,
 	}
 
 	*srcuidx = srcu_read_lock(&wakeup_srcu);
-	list_for_each_entry_rcu_locked(ws, &wakeup_sources, entry) {
+	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
 		if (n-- <= 0)
 			return ws;
 	}
@@ -1156,9 +1159,6 @@ static void *wakeup_sources_stats_seq_next(struct seq_file *m,
 		next_ws = ws;
 		break;
 	}
-
-	if (!next_ws)
-		print_wakeup_source_stats(m, &deleted_ws);
 
 	return next_ws;
 }
