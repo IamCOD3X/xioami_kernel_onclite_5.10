@@ -1721,82 +1721,20 @@ struct tcp_fastopen_context {
 	struct rcu_head	rcu;
 };
 
-extern unsigned int sysctl_tcp_fastopen_blackhole_timeout;
-void tcp_fastopen_active_disable(struct sock *sk);
-bool tcp_fastopen_active_should_disable(struct sock *sk);
-void tcp_fastopen_active_disable_ofo_check(struct sock *sk);
-void tcp_fastopen_active_detect_blackhole(struct sock *sk, bool expired);
+static inline void tcp_init_send_head(struct sock *sk);
 
-/* Caller needs to wrap with rcu_read_(un)lock() */
-static inline
-struct tcp_fastopen_context *tcp_fastopen_get_ctx(const struct sock *sk)
+/* write queue abstraction */
+static inline void tcp_write_queue_purge(struct sock *sk)
 {
-	struct tcp_fastopen_context *ctx;
+	struct sk_buff *skb;
 
-	ctx = rcu_dereference(inet_csk(sk)->icsk_accept_queue.fastopenq.ctx);
-	if (!ctx)
-		ctx = rcu_dereference(sock_net(sk)->ipv4.tcp_fastopen_ctx);
-	return ctx;
-}
-
-static inline
-bool tcp_fastopen_cookie_match(const struct tcp_fastopen_cookie *foc,
-			       const struct tcp_fastopen_cookie *orig)
-{
-	if (orig->len == TCP_FASTOPEN_COOKIE_SIZE &&
-	    orig->len == foc->len &&
-	    !memcmp(orig->val, foc->val, foc->len))
-		return true;
-	return false;
-}
-
-static inline
-int tcp_fastopen_context_len(const struct tcp_fastopen_context *ctx)
-{
-	return ctx->num;
-}
-
-/* Latencies incurred by various limits for a sender. They are
- * chronograph-like stats that are mutually exclusive.
- */
-enum tcp_chrono {
-	TCP_CHRONO_UNSPEC,
-	TCP_CHRONO_BUSY, /* Actively sending data (non-empty write queue) */
-	TCP_CHRONO_RWND_LIMITED, /* Stalled by insufficient receive window */
-	TCP_CHRONO_SNDBUF_LIMITED, /* Stalled by insufficient send buffer */
-	__TCP_CHRONO_MAX,
-};
-
-void tcp_chrono_start(struct sock *sk, const enum tcp_chrono type);
-void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type);
-
-/* This helper is needed, because skb->tcp_tsorted_anchor uses
- * the same memory storage than skb->destructor/_skb_refdst
- */
-static inline void tcp_skb_tsorted_anchor_cleanup(struct sk_buff *skb)
-{
-	skb->destructor = NULL;
-	skb->_skb_refdst = 0UL;
-}
-
-#define tcp_skb_tsorted_save(skb) {		\
-	unsigned long _save = skb->_skb_refdst;	\
-	skb->_skb_refdst = 0UL;
-
-#define tcp_skb_tsorted_restore(skb)		\
-	skb->_skb_refdst = _save;		\
-}
-
-void tcp_write_queue_purge(struct sock *sk);
-
-static inline struct sk_buff *tcp_rtx_queue_head(const struct sock *sk)
-{
-	return skb_rb_first(&sk->tcp_rtx_queue);
-}
-
-static inline struct sk_buff *tcp_rtx_queue_tail(const struct sock *sk)
-{
-	return skb_rb_last(&sk->tcp_rtx_queue);
+	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL)
+		sk_wmem_free_skb(sk, skb);
+        tcp_init_send_head(sk);
+	sk_mem_reclaim(sk);
+	tcp_clear_all_retrans_hints(tcp_sk(sk));
+	tcp_init_send_head(sk);
+	inet_csk(sk)->icsk_backoff = 0;
 }
 
 static inline struct sk_buff *tcp_write_queue_head(const struct sock *sk)
